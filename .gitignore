@@ -1,0 +1,14 @@
+# MATLAB backups, caches and generated code
+*.asv
+*.autosave
+slprj/
+codegen/
+*.mex*
+
+# OS / editors
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.log
+~$*
