@@ -27,11 +27,11 @@ pinn-fedbatch/
 │   ├── phase2_sensitivity_fd.m
 │   └── phase2_compare_inputs.m
 ├── archive/
-│   ├── PINN_v12.m               # Unmodified uploaded source
-│   └── PINN_v9.m                # Earlier version
-├── data/                        # Place data.csv here (ignored by Git)
-├── presentation/                # Add a presentation .pptx here
-└── results/                     # Optional shareable outputs
+│   ├── PINN_v12.m               
+│   └── PINN_v9.m                
+├── data/                         
+├── presentation/                 
+└── results/                   
 ```
 
 ## Requirements
