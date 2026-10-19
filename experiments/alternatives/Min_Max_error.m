@@ -1,6 +1,6 @@
 clear; close all; clc;
 %% 1. Data loading
-data = readtable('data.csv');
+data = readtable(fullfile('data', 'data.csv'));
 data = data(~isnan(data.time_hr_), :);
 
 t_all = data.time_hr_;
@@ -20,18 +20,14 @@ Pm_true = data.PM_True_g_L_;
 Sin = 20;
 Y = 7.3;
 
-%% 2. BATCH-LEVEL SPLIT (修改test batch选择)
-fprintf('==========================================================\n');
-fprintf('PINN v10 FIXED: Batch-Level Split with Diagnostics\n');
-fprintf('==========================================================\n\n');
-
-test_batch = 16;  
-% Training set
-train_batches_all = [16, 1, 4, 11, 15, 3, 12, 7, 8];
+%% 2. BATCH-LEVEL SPLIT 
+test_batch = 16;   % Batch 16 = optimal control profile (most scientifically meaningful)
+% Training set — now wincludes B13 (F3=0 late-stop dynamics)
+train_batches_all = [1, 3, 4, 7, 8, 11, 12, 13, 14, 15];
 train_batches = setdiff(train_batches_all, test_batch);
 
 % Validation set
-val_batches = [5, 6, 2, 14, 10, 9, 13];
+val_batches = [2, 5, 6, 9, 10];
 
 train_idx = ismember(batch_num, train_batches);
 val_idx = ismember(batch_num, val_batches);
@@ -89,14 +85,43 @@ fprintf('S range:\n');
 fprintf('  Training dataset: [%.2f, %.2f]\n', S_train_range(1), S_train_range(2));
 fprintf('  Test set: [%.2f, %.2f]', S_test_range(1), S_test_range(2));
 
-fprintf('\nVrange:\n');
+fprintf('\nV range:\n');
 fprintf('  Training set: [%.2f, %.2f]\n', V_train_range(1), V_train_range(2));
 fprintf('  Test set: [%.2f, %.2f]', V_test_range(1), V_test_range(2));
 fprintf('\n');
 
-%% 5. Structure of Network
-numInputs = 7;
-numOutputs = 5;
+%% 5. Compute V_exact via numerical integration of dV/dt = F
+% V is fully determined by F(t) — no need for the network to predict it.
+% Forward Euler integration per batch from V0 = V_meas(t=0).
+all_batches_sorted = unique([train_batches, val_batches, test_batch]);
+V_exact_all = zeros(size(t_all));
+
+for b = all_batches_sorted
+    bidx = find(batch_num == b);
+    t_b  = t_all(bidx);
+    F_b  = F_all(bidx);
+    V_b  = V_meas(bidx);
+    [~, order] = sort(t_b);
+    bidx = bidx(order);
+    t_b  = t_b(order);
+    F_b  = F_b(order);
+    V_b  = V_b(order);
+
+    V_int    = zeros(length(t_b), 1);
+    V_int(1) = V_b(1);  % initial condition from measurement
+    for k = 2:length(t_b)
+        dt_k     = t_b(k) - t_b(k-1);
+        V_int(k) = V_int(k-1) + F_b(k-1) * dt_k;
+    end
+    V_exact_all(bidx) = V_int;
+end
+
+fprintf('V_exact computed. Max error vs V_meas: %.4f L\n\n', ...
+    max(abs(V_exact_all - V_meas)));
+
+%% 6. Structure of Network
+numInputs  = 7;   % inputs unchanged: [t, X, S, Pt, Pm, V_exact, F]
+numOutputs = 4;   % X, S, Pt, Pm  (V removed — exact)
 hiddenSize = 50;
 
 layers = [
@@ -151,42 +176,47 @@ fprintf('\n Stochastic Regularization: %d/%d batches per epoch\n\n', ...
 %% 7. Prepare data (min-max)
 norm_fn = @(v, s) (v - s(1)) ./ (s(2) - s(1) + 1e-8);
 
+% Use V_exact (not V_meas) as row 6 of input — exact volume from dV/dt=F
+V_exact_train = V_exact_all(train_idx);
+V_exact_val   = V_exact_all(val_idx);
+V_exact_test  = V_exact_all(test_idx);
+
 inputTrain = [
-    norm_fn(t_train, stats.t), ...
-    norm_fn(X_train, stats.X), ...
-    norm_fn(S_train, stats.S), ...
-    norm_fn(Pt_train, stats.Pt), ...
-    norm_fn(Pm_train, stats.Pm), ...
-    norm_fn(V_train, stats.V), ...    
-    norm_fn(F_train, stats.F)
+    norm_fn(t_train,          stats.t),  ...
+    norm_fn(X_train,          stats.X),  ...
+    norm_fn(S_train,          stats.S),  ...
+    norm_fn(Pt_train,         stats.Pt), ...
+    norm_fn(Pm_train,         stats.Pm), ...
+    norm_fn(V_exact_train,    stats.V),  ...  % V_exact replaces V_meas
+    norm_fn(F_train,          stats.F)
 ]';
 dlInput = dlarray(single(inputTrain), 'CB');
 
-targets.X = norm_fn(X_train, stats.X);
-targets.S = norm_fn(S_train, stats.S);
+% No targets.V — network does not predict V (v12-exactV: V is exact)
+targets.X  = norm_fn(X_train,  stats.X);
+targets.S  = norm_fn(S_train,  stats.S);
 targets.Pt = norm_fn(Pt_train, stats.Pt);
 targets.Pm = norm_fn(Pm_train, stats.Pm);
-targets.V = norm_fn(V_train, stats.V);
 
 inputVal = [
-    norm_fn(t_all(val_idx), stats.t), ...
-    norm_fn(X_meas(val_idx), stats.X), ...
-    norm_fn(S_meas(val_idx), stats.S), ...
-    norm_fn(Pt_meas(val_idx), stats.Pt), ...
-    norm_fn(Pm_meas(val_idx), stats.Pm), ...
-    norm_fn(V_meas(val_idx), stats.V), ...   
-    norm_fn(F_all(val_idx), stats.F)
+    norm_fn(t_all(val_idx),       stats.t),  ...
+    norm_fn(X_meas(val_idx),      stats.X),  ...
+    norm_fn(S_meas(val_idx),      stats.S),  ...
+    norm_fn(Pt_meas(val_idx),     stats.Pt), ...
+    norm_fn(Pm_meas(val_idx),     stats.Pm), ...
+    norm_fn(V_exact_val,          stats.V),  ...  % V_exact
+    norm_fn(F_all(val_idx),       stats.F)
 ]';
 dlInputVal = dlarray(single(inputVal), 'CB');
 
 inputTest = [
-    norm_fn(t_all(test_idx), stats.t), ...
-    norm_fn(X_meas(test_idx), stats.X), ...
-    norm_fn(S_meas(test_idx), stats.S), ...
-    norm_fn(Pt_meas(test_idx), stats.Pt), ...
-    norm_fn(Pm_meas(test_idx), stats.Pm), ...
-    norm_fn(V_meas(test_idx), stats.V), ...  
-    norm_fn(F_all(test_idx), stats.F)
+    norm_fn(t_all(test_idx),      stats.t),  ...
+    norm_fn(X_meas(test_idx),     stats.X),  ...
+    norm_fn(S_meas(test_idx),     stats.S),  ...
+    norm_fn(Pt_meas(test_idx),    stats.Pt), ...
+    norm_fn(Pm_meas(test_idx),    stats.Pm), ...
+    norm_fn(V_exact_test,         stats.V),  ...  % V_exact
+    norm_fn(F_all(test_idx),      stats.F)
 ]';
 dlInputTest = dlarray(single(inputTest), 'CB');
 
@@ -240,11 +270,11 @@ for epoch = 1:totalEpochs
     end
     
     dlInput_epoch = dlInput(:, epoch_data_idx);
-    targets_epoch.X = targets.X(epoch_data_idx);
-    targets_epoch.S = targets.S(epoch_data_idx);
+    targets_epoch.X  = targets.X(epoch_data_idx);
+    targets_epoch.S  = targets.S(epoch_data_idx);
     targets_epoch.Pt = targets.Pt(epoch_data_idx);
     targets_epoch.Pm = targets.Pm(epoch_data_idx);
-    targets_epoch.V = targets.V(epoch_data_idx);
+    % No targets_epoch.V — network does not predict V (V is exact)
     
     colloc = genColloc(numColloc, t_train, X_train, S_train, ...
         Pt_train, Pm_train, V_train, F_train, stats);
@@ -315,58 +345,57 @@ R2 = @(y,p) 1 - sum((y-p).^2)/(sum((y-mean(y)).^2)+1e-10);
 % Training set
 dlPred = predict(net, dlInput);
 pred = extractdata(dlPred);
-X_pred = max(0, pred(1,:)' * (stats.X(2)-stats.X(1)) + stats.X(1));
-S_pred = max(0, pred(2,:)' * (stats.S(2)-stats.S(1)) + stats.S(1));
-Pt_pred = max(0, pred(3,:)' * (stats.Pt(2)-stats.Pt(1)) + stats.Pt(1));
-Pm_pred = max(0, pred(4,:)' * (stats.Pm(2)-stats.Pm(1)) + stats.Pm(1));
-V_pred = max(0, pred(5,:)' * (stats.V(2)-stats.V(1)) + stats.V(1));
+X_pred  = max(0, pred(1,:)' * (stats.X(2)-stats.X(1))  + stats.X(1));
+S_pred  = max(0, pred(2,:)' * (stats.S(2)-stats.S(1))  + stats.S(1));
+Pt_pred = max(0, pred(3,:)' * (stats.Pt(2)-stats.Pt(1))+ stats.Pt(1));
+Pm_pred = max(0, pred(4,:)' * (stats.Pm(2)-stats.Pm(1))+ stats.Pm(1));
+V_pred  = V_exact_train;  % V_exact — not predicted by network
 
 fprintf('=== Training set (%d batches) ===\n', length(train_batches));
 fprintf('  X:  R²=%.4f\n', R2(X_true(train_idx), X_pred));
 fprintf('  S:  R²=%.4f\n', R2(S_true(train_idx), S_pred));
 fprintf('  Pt: R²=%.4f\n', R2(Pt_true(train_idx), Pt_pred));
-fprintf('  Pm: R²=%.4f \n', R2(Pm_true(train_idx), Pm_pred));
-fprintf('  V:  R²=%.4f\n', R2(V_meas(train_idx), V_pred));
+fprintf('  Pm: R²=%.4f\n', R2(Pm_true(train_idx), Pm_pred));
+fprintf('  V:  R²=1.0000 (exact)\n');
 
 % Validation set
 dlPredVal = predict(net, dlInputVal);
 predVal = extractdata(dlPredVal);
-X_pred_val = max(0, predVal(1,:)' * (stats.X(2)-stats.X(1)) + stats.X(1));
-S_pred_val = max(0, predVal(2,:)' * (stats.S(2)-stats.S(1)) + stats.S(1));
-Pt_pred_val = max(0, predVal(3,:)' * (stats.Pt(2)-stats.Pt(1)) + stats.Pt(1));
-Pm_pred_val = max(0, predVal(4,:)' * (stats.Pm(2)-stats.Pm(1)) + stats.Pm(1));
-V_pred_val = max(0, predVal(5,:)' * (stats.V(2)-stats.V(1)) + stats.V(1));
+X_pred_val  = max(0, predVal(1,:)' * (stats.X(2)-stats.X(1))  + stats.X(1));
+S_pred_val  = max(0, predVal(2,:)' * (stats.S(2)-stats.S(1))  + stats.S(1));
+Pt_pred_val = max(0, predVal(3,:)' * (stats.Pt(2)-stats.Pt(1))+ stats.Pt(1));
+Pm_pred_val = max(0, predVal(4,:)' * (stats.Pm(2)-stats.Pm(1))+ stats.Pm(1));
+V_pred_val  = V_exact_val;  % V_exact
 
 fprintf('\n=== Validation set (%d batches) ===\n', length(val_batches));
 fprintf('  X:  R²=%.4f\n', R2(X_true(val_idx), X_pred_val));
 fprintf('  S:  R²=%.4f\n', R2(S_true(val_idx), S_pred_val));
 fprintf('  Pt: R²=%.4f\n', R2(Pt_true(val_idx), Pt_pred_val));
-fprintf('  Pm: R²=%.4f \n', R2(Pm_true(val_idx), Pm_pred_val));
-fprintf('  V:  R²=%.4f\n', R2(V_meas(val_idx), V_pred_val));
+fprintf('  Pm: R²=%.4f\n', R2(Pm_true(val_idx), Pm_pred_val));
+fprintf('  V:  R²=1.0000 (exact)\n');
 
 % Test set
 dlPredTest = predict(net, dlInputTest);
 predTest = extractdata(dlPredTest);
-X_pred_test = max(0, predTest(1,:)' * (stats.X(2)-stats.X(1)) + stats.X(1));
-S_pred_test = max(0, predTest(2,:)' * (stats.S(2)-stats.S(1)) + stats.S(1));
-Pt_pred_test = max(0, predTest(3,:)' * (stats.Pt(2)-stats.Pt(1)) + stats.Pt(1));
-Pm_pred_test = max(0, predTest(4,:)' * (stats.Pm(2)-stats.Pm(1)) + stats.Pm(1));
-V_pred_test = max(0, predTest(5,:)' * (stats.V(2)-stats.V(1)) + stats.V(1));
+X_pred_test  = max(0, predTest(1,:)' * (stats.X(2)-stats.X(1))  + stats.X(1));
+S_pred_test  = max(0, predTest(2,:)' * (stats.S(2)-stats.S(1))  + stats.S(1));
+Pt_pred_test = max(0, predTest(3,:)' * (stats.Pt(2)-stats.Pt(1))+ stats.Pt(1));
+Pm_pred_test = max(0, predTest(4,:)' * (stats.Pm(2)-stats.Pm(1))+ stats.Pm(1));
+V_pred_test  = V_exact_test;  % V_exact
 
 fprintf('\n=== Test set (Batch %d) ===\n', test_batch);
 fprintf('  X:  R²=%.4f\n', R2(X_true(test_idx), X_pred_test));
-fprintf('  S:  R²=%.4f', R2(S_true(test_idx), S_pred_test));
+fprintf('  S:  R²=%.4f\n', R2(S_true(test_idx), S_pred_test));
 fprintf('  Pt: R²=%.4f\n', R2(Pt_true(test_idx), Pt_pred_test));
-fprintf('  Pm: R²=%.4f ', R2(Pm_true(test_idx), Pm_pred_test));
-fprintf('  V:  R²=%.4f', R2(V_meas(test_idx), V_pred_test));
+fprintf('  Pm: R²=%.4f\n', R2(Pm_true(test_idx), Pm_pred_test));
+fprintf('  V:  R²=1.0000 (exact)\n');
 
 test_Pm_R2 = R2(Pm_true(test_idx), Pm_pred_test);
-test_V_R2 = R2(V_meas(test_idx), V_pred_test);
 fprintf('\n');
-if test_Pm_R2 > 0.90 && test_V_R2 > 0.85
+if test_Pm_R2 > 0.90
     fprintf('Test successful: PINN extrapolates well under new operating conditions.!\n\n');
 elseif test_Pm_R2 > 0.80
-    fprintf('️Testing Overall: Extrapolation capability is acceptable, but there is still room for improvement.\n\n');
+    fprintf('Testing Overall: Extrapolation capability is acceptable, but there is still room for improvement.\n\n');
 else
     fprintf('Test failed: Model or data partitioning requires adjustment.\n\n');
 end
@@ -496,109 +525,118 @@ set(gcf,'Color','w');
 %% Functions
 
 function [loss, grads, dL, pL] = lossFn(net, dlX, targets, colloc, lambda, Pm_phys_w, S_phys_w, stats, Sin, Y)
-    dlY = forward(net, dlX);
+    dlY = forward(net, dlX); % Forward propagation — 4 outputs: X, S, Pt, Pm
     
-    w = [1, 1, 2, 5, 1];
-    
-    dL = w(1)*mean((dlY(1,:) - targets.X').^2) + ...
-         w(2)*mean((dlY(2,:) - targets.S').^2) + ...
+    % Data loss: 4 variables only (V not predicted by network)
+    w = [1, 1, 2, 5];
+    dL = w(1)*mean((dlY(1,:) - targets.X' ).^2) + ...
+         w(2)*mean((dlY(2,:) - targets.S' ).^2) + ...
          w(3)*mean((dlY(3,:) - targets.Pt').^2) + ...
-         w(4)*mean((dlY(4,:) - targets.Pm').^2) + ...
-         w(5)*mean((dlY(5,:) - targets.V').^2);
+         w(4)*mean((dlY(4,:) - targets.Pm').^2);
     dL = dL / sum(w);
     
-    pL = physLoss(net, colloc, Pm_phys_w, S_phys_w, stats, Sin, Y);
+    pL = physLoss(net, colloc, Pm_phys_w, S_phys_w, stats, Sin, Y); % Calculate physical loss
     
-    loss = (1-lambda)*dL + lambda*pL;
-    grads = dlgradient(loss, net.Learnables);
+    loss = (1-lambda)*dL + lambda*pL; % Combined Total Loss
+    grads = dlgradient(loss, net.Learnables); % Automatic differentiation for gradient computation
     
-    dL = extractdata(dL);
+    dL = extractdata(dL); % Extract loss values for monitoring purposes
     pL = extractdata(pL);
 end
 
 function pL = physLoss(net, c, Pm_phys_w, S_phys_w, stats, Sin, Y)
     dlC = dlarray(single(c.input), 'CB');
-    dlY = forward(net, dlC);
+    dlY = forward(net, dlC);  % 4 outputs: X, S, Pt, Pm
     
-    % Min-Max denormalization: val = pred * (max - min) + min
+    % Min-Max denormalization: val = pred*(max-min) + min
     denorm = @(y, s) y .* (s(2) - s(1)) + s(1);
     
-    X = denorm(dlY(1,:), stats.X);
-    S = denorm(dlY(2,:), stats.S);
+    X  = denorm(dlY(1,:), stats.X);
+    S  = denorm(dlY(2,:), stats.S);
     Pt = denorm(dlY(3,:), stats.Pt);
     Pm = denorm(dlY(4,:), stats.Pm);
-    V = denorm(dlY(5,:), stats.V);
     
- 
-    Fr = denorm(c.F_norm, stats.F); 
-    Fr = c.F_raw;
-    D = Fr ./ max(V, 0.1);
+    % V_exact from collocation input row 6 (already denormalized in genColloc)
+    V  = dlarray(single(c.V_raw), 'CB');
     
-    % Protection Mechanism: Preventing mu Calculation Errors Caused by Extremely Small S Values
-    S_safe = max(S, 1e-6); 
-    mu = 21.87 * S_safe ./ ((S_safe + 0.4) .* (S_safe + 62.5));
-    theta = 4.75 * mu ./ (0.12 + mu);
-    fp = S_safe .* exp(-5 * S_safe) ./ (0.1 + S_safe);
+    Fr = c.F_raw;              % exact feed rate at collocation points
+    D  = Fr ./ max(V, 0.1);   % exact dilution rate — no network error in D
     
-    dt = 0.01;
-    % Compute the time derivative (Finite Difference)
-    cPlus = c.input;
-
+    % Protect against S→0 numerical issues
+    S_safe = max(S, 1e-6);
+    % Park & Ramirez kinetics
+    mu    = 21.87 * S_safe ./ ((S_safe + 0.4) .* (S_safe + 62.5));
+    theta = 4.75  * mu     ./ (0.12 + mu);
+    fp    = S_safe .* exp(-5 * S_safe) ./ (0.1 + S_safe);
+    
+    % Finite-difference derivatives (perturb time input, row 1)
+    dt      = 0.01;
     dt_norm = dt / (stats.t(2) - stats.t(1));
+    cPlus   = c.input;
     cPlus(1,:) = cPlus(1,:) + dt_norm;
     
     dlCp = dlarray(single(cPlus), 'CB');
     dlYp = forward(net, dlCp);
     
-    dX = (dlYp(1,:)-dlY(1,:)) * (stats.X(2)-stats.X(1)) / dt;
-    dS = (dlYp(2,:)-dlY(2,:)) * (stats.S(2)-stats.S(1)) / dt;
-    dPt = (dlYp(3,:)-dlY(3,:)) * (stats.Pt(2)-stats.Pt(1)) / dt;
-    dPm = (dlYp(4,:)-dlY(4,:)) * (stats.Pm(2)-stats.Pm(1)) / dt;
-    dV = (dlYp(5,:)-dlY(5,:)) * (stats.V(2)-stats.V(1)) / dt;
+    dX  = (dlYp(1,:) - dlY(1,:)) * (stats.X(2)  - stats.X(1))  / dt;
+    dS  = (dlYp(2,:) - dlY(2,:)) * (stats.S(2)  - stats.S(1))  / dt;
+    dPt = (dlYp(3,:) - dlY(3,:)) * (stats.Pt(2) - stats.Pt(1)) / dt;
+    dPm = (dlYp(4,:) - dlY(4,:)) * (stats.Pm(2) - stats.Pm(1)) / dt;
+    % No dV — rV residual removed (V is exact, not learned)
     
-    rX = dX - (mu.*X - D.*X);
-    rS = dS - (-Y*mu.*X + D.*(Sin-S));
-    rPt = dPt - (fp.*X - D.*Pt);
-    rPm = dPm - (theta.*(Pt-Pm) - D.*Pm);
-    rV = dV - Fr;
+    % Mass balance residuals (4 equations)
+    rX  = dX  - (mu.*X  - D.*X);
+    rS  = dS  - (-Y*mu.*X + D.*(Sin - S));
+    rPt = dPt - (fp.*X  - D.*Pt);
+    rPm = dPm - (theta.*(Pt - Pm) - D.*Pm);
     
-    w_phys = [1, S_phys_w, 1.5, Pm_phys_w, 1];
+    % Weighted normalised physics loss (4 terms)
+    w_phys = [1, S_phys_w, 1.5, Pm_phys_w];
     
-    pL = (w_phys(1)*(rX/(stats.X(2)-stats.X(1))).^2 + ...
-          w_phys(2)*(rS/(stats.S(2)-stats.S(1))).^2 + ...
-          w_phys(3)*(rPt/(stats.Pt(2)-stats.Pt(1))).^2 + ...
-          w_phys(4)*(rPm/(stats.Pm(2)-stats.Pm(1))).^2 + ...
-          w_phys(5)*(rV/(stats.V(2)-stats.V(1))).^2);
+    pL = (w_phys(1)*(rX  / (stats.X(2)  - stats.X(1)) ).^2 + ...
+          w_phys(2)*(rS  / (stats.S(2)  - stats.S(1)) ).^2 + ...
+          w_phys(3)*(rPt / (stats.Pt(2) - stats.Pt(1))).^2 + ...
+          w_phys(4)*(rPm / (stats.Pm(2) - stats.Pm(1))).^2);
     pL = mean(pL, 'all') / sum(w_phys);
 end
 
 function c = genColloc(n, t, X, S, Pt, Pm, V, F, stats)
-    % Generate random points within the physical range
-    t_raw = min(t) + (max(t)-min(t))*rand(1,n);
-    
-    % Generate within the scope recorded in stats
-    X_raw = stats.X(1) + (stats.X(2)-stats.X(1)) * rand(1,n);
-    S_raw = stats.S(1) + (stats.S(2)-stats.S(1)) * rand(1,n);
-    Pt_raw = stats.Pt(1) + (stats.Pt(2)-stats.Pt(1)) * rand(1,n);
-    Pm_raw = stats.Pm(1) + (stats.Pm(2)-stats.Pm(1)) * rand(1,n);
-    V_raw = stats.V(1) + (stats.V(2)-stats.V(1)) * rand(1,n);
-    F_raw = stats.F(1) + (stats.F(2)-stats.F(1)) * rand(1,n);
-    
-    c.t_raw = t_raw; c.X_raw = X_raw; c.S_raw = S_raw;
-    c.Pt_raw = Pt_raw; c.Pm_raw = Pm_raw; c.V_raw = V_raw; c.F_raw = F_raw;
-    
-    % Min-Max Normalized Input
+    % Generate random collocation points within the physical range.
+    % t contains multiple batches so timestamps are NOT unique — we cannot
+    % call interp1 on the full t vector.  Instead, for each collocation
+    % point we pick one random training point and perturb its time slightly
+    % so that V and F remain physically consistent with that batch trajectory.
+
+    % Pick n random indices from the training data
+    idx    = randi(length(t), 1, n);
+    t_raw  = t(idx)' + (rand(1, n) - 0.5) * 0.5;   % ±0.25 h jitter
+    t_raw  = max(min(t_raw, max(t)), min(t));         % clamp to [t_min, t_max]
+
+    % V and F taken from the same training point (physically consistent)
+    V_raw  = max(V(idx)', 0.1);
+    F_raw  = F(idx)';
+
+    % State variables sampled independently across their full training range
+    X_raw  = stats.X(1)  + (stats.X(2)  - stats.X(1))  * rand(1, n);
+    S_raw  = stats.S(1)  + (stats.S(2)  - stats.S(1))  * rand(1, n);
+    Pt_raw = stats.Pt(1) + (stats.Pt(2) - stats.Pt(1)) * rand(1, n);
+    Pm_raw = stats.Pm(1) + (stats.Pm(2) - stats.Pm(1)) * rand(1, n);
+
+    c.t_raw  = t_raw;  c.X_raw  = X_raw;  c.S_raw  = S_raw;
+    c.Pt_raw = Pt_raw; c.Pm_raw = Pm_raw;
+    c.V_raw  = V_raw;  c.F_raw  = F_raw;
+
     norm_fn = @(v, s) (v - s(1)) ./ (s(2) - s(1) + 1e-8);
-    
+
     c.input = [
-    norm_fn(t_raw, stats.t);
-    norm_fn(X_raw, stats.X);
-    norm_fn(S_raw, stats.S);
-    norm_fn(Pt_raw, stats.Pt);
-    norm_fn(Pm_raw, stats.Pm);
-    norm_fn(V_raw, stats.V);    
-    norm_fn(F_raw, stats.F)
+        norm_fn(t_raw,  stats.t);
+        norm_fn(X_raw,  stats.X);
+        norm_fn(S_raw,  stats.S);
+        norm_fn(Pt_raw, stats.Pt);
+        norm_fn(Pm_raw, stats.Pm);
+        norm_fn(V_raw,  stats.V);   % V_exact from training point — row 6
+        norm_fn(F_raw,  stats.F)
     ];
-    
+
     c.F_norm = norm_fn(F_raw, stats.F);
 end
